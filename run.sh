@@ -1,0 +1,1 @@
+go build -o tx_monitor tx_monitor.go && ./tx_monitor --txlog test_tx.log
