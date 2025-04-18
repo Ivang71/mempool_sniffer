@@ -1,0 +1,19 @@
+{
+    "name": "mempool-sniffer",
+    "version": "0.0.1",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "ts-node src/index.ts"
+    },
+    "dependencies": {
+        "ethers": "^6.0.0",
+        "dotenv": "^16.0.0",
+        "axios": "^1.0.0"
+    },
+    "devDependencies": {
+        "ts-node": "^10.0.0",
+        "typescript": "^5.0.0",
+        "@types/node": "^18.0.0"
+    }
+}
