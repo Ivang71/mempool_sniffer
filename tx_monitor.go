@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,14 +13,17 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/p2p/nat"
-	"github.com/ethereum/go-ethereum/rlp"
 )
 
+// Eth protocol message codes
 const (
 	StatusMsg                     = 0x00
 	TransactionsMsg               = 0x02
@@ -28,19 +32,21 @@ const (
 	PooledTransactionsMsg         = 0x0a
 )
 
-type ForkID struct {
-	Hash [4]byte
-	Next uint64
-}
+// statusData represents the EIP-2124 status packet for eth/68
+// in the order: ProtocolVersion, NetworkID, TD, Head, Genesis, ForkID
+// forkid.ID implements the RLP encoding for forkID data
+// See: https://eips.ethereum.org/EIPS/eip-2124
 
-type StatusPacket struct {
+type statusData struct {
 	ProtocolVersion uint32
 	NetworkID       uint64
 	TD              *big.Int
 	Head            common.Hash
 	Genesis         common.Hash
-	ForkID          ForkID
+	ForkID          forkid.ID
 }
+
+// TxInfo holds transaction details for JSON output
 
 type TxInfo struct {
 	Hash      string    `json:"hash"`
@@ -53,21 +59,20 @@ type TxInfo struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// TxMonitor stores state for incoming transactions and chain data client
 type TxMonitor struct {
+	rpcClient   *ethclient.Client
 	txs         map[string]TxInfo
 	knownHashes map[string]bool
 	mutex       sync.RWMutex
-	nodeID      string
 	txLogFile   *os.File
 }
 
 var (
-	listenAddr = flag.String("addr", ":30303", "P2P listen address")
-	httpAddr   = flag.String("http", ":8080", "HTTP API address")
-	networkID  = flag.Uint64("networkid", 1, "Network ID")
-	txLogFile  = flag.String("txlog", "transactions.log", "Transaction log file")
-
-	defaultBootnodes = []string{
+	httpAddr  = flag.String("http", ":8080", "HTTP API address")
+	networkID = flag.Uint64("networkid", 1, "Network ID, e.g. 1 for mainnet")
+	txLogPath = flag.String("txlog", "transactions.log", "Transaction log file path")
+	bootnodes = []string{
 		"enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",
 		"enode://22a8232c3abc76a16ae9d6c3b164f98775fe226f0917b0ca871128a74a8e9630b458460865bab457221f1d448dd9791d24c4e5d88786180ac185df813a68d4de@3.209.45.79:30303",
 	}
@@ -76,205 +81,236 @@ var (
 func main() {
 	flag.Parse()
 
-	// Open log file
-	txFile, err := os.OpenFile(*txLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Initialize RPC client
+	rpc, err := ethclient.DialContext(context.Background(), "http://localhost:8545")
 	if err != nil {
-		log.Fatalf("Failed to open transaction log file: %v", err)
+		log.Fatalf("RPC dial error: %v", err)
+	}
+	defer rpc.Close()
+
+	// Open transaction log file
+	txFile, err := os.OpenFile(*txLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Tx log file error: %v", err)
 	}
 	defer txFile.Close()
-	log.Printf("Saving transactions to %s", *txLogFile)
 
-	// Generate node key and parse bootnodes
+	// Parse static nodes
 	nodeKey, _ := crypto.GenerateKey()
-	nodeID := enode.PubkeyToIDV4(&nodeKey.PublicKey)
-
-	var bootnodes []*enode.Node
-	for _, url := range defaultBootnodes {
-		if n, err := enode.ParseV4(url); err == nil {
-			bootnodes = append(bootnodes, n)
+	var staticNodes []*enode.Node
+	for _, uri := range bootnodes {
+		if n, err := enode.ParseV4(uri); err == nil {
+			staticNodes = append(staticNodes, n)
 		}
 	}
 
-	// Create monitor
+	// Setup monitor state
 	monitor := &TxMonitor{
+		rpcClient:   rpc,
 		txs:         make(map[string]TxInfo),
 		knownHashes: make(map[string]bool),
-		nodeID:      nodeID.String(),
 		txLogFile:   txFile,
 	}
 
 	// Configure P2P server
-	srv := &p2p.Server{
-		Config: p2p.Config{
-			PrivateKey:     nodeKey,
-			MaxPeers:       50,
-			Name:           "ETH TxMonitor",
-			ListenAddr:     *listenAddr,
-			NAT:            nat.Any(),
-			BootstrapNodes: bootnodes,
-			Protocols: []p2p.Protocol{{
-				Name:    "eth",
-				Version: 68,
-				Length:  17,
-				Run:     monitor.HandlePeer,
-			}},
-		},
-	}
+	srv := &p2p.Server{Config: p2p.Config{
+		PrivateKey:  nodeKey,
+		MaxPeers:    50,
+		Name:        "eth-tx-monitor",
+		ListenAddr:  "0.0.0.0:30303",
+		NoDiscovery: false,
+		StaticNodes: staticNodes,
+		Protocols: []p2p.Protocol{{
+			Name:    "eth",
+			Version: 68,
+			Length:  17,
+			Run:     monitor.HandlePeer,
+		}},
+	}}
 
-	// Start server
+	// Start P2P
 	if err := srv.Start(); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+		log.Fatalf("P2P start error: %v", err)
 	}
 	defer srv.Stop()
 
-	// Start HTTP API
+	// Subscribe to peer events
+	events := make(chan *p2p.PeerEvent, 16)
+	srv.SubscribeEvents(events)
+	go func() {
+		for ev := range events {
+			log.Printf(
+				"Peer event Type=%v Peer=%s Local=%s Remote=%s Error=%s MsgCode=%v MsgSize=%v Protocol=%s",
+				ev.Type, ev.Peer, ev.LocalAddress, ev.RemoteAddress,
+				ev.Error, ev.MsgCode, ev.MsgSize, ev.Protocol,
+			)
+		}
+	}()
+
+	// Log peer count periodically
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			log.Printf("Connected peers: %d", srv.PeerCount())
+		}
+	}()
+
+	// HTTP API
 	http.HandleFunc("/txs", monitor.handleTxs)
-	http.HandleFunc("/", monitor.handleTxs)
-	go http.ListenAndServe(*httpAddr, nil)
+	log.Printf("HTTP listening on %s", *httpAddr)
+	go func() {
+		if err := http.ListenAndServe(*httpAddr, nil); err != nil {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
 
-	log.Printf("P2P server started on %s, HTTP on %s", *listenAddr, *httpAddr)
-
-	// Keep application alive
+	log.Println("P2P node listening on port 30303")
 	select {}
 }
 
+// handleTxs serves stored transactions as JSON
 func (tm *TxMonitor) handleTxs(w http.ResponseWriter, r *http.Request) {
 	tm.mutex.RLock()
 	defer tm.mutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-
-	txs := make([]TxInfo, 0, len(tm.txs))
+	out := make([]TxInfo, 0, len(tm.txs))
 	for _, tx := range tm.txs {
-		txs = append(txs, tx)
+		out = append(out, tx)
 	}
-
-	json.NewEncoder(w).Encode(txs)
+	json.NewEncoder(w).Encode(out)
 }
 
+// getHeadAndTD retrieves head hash, total difficulty, and genesis
+func getHeadAndTD(rpc *ethclient.Client) (common.Hash, *big.Int, *types.Block, error) {
+	ctx := context.Background()
+	
+	head, err := rpc.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return common.Hash{}, nil, nil, err
+	}
+	genesis, err := rpc.BlockByNumber(ctx, big.NewInt(0))
+	if err != nil {
+		return common.Hash{}, nil, nil, err
+	}
+	// Raw RPC for totalDifficulty
+	var res struct{ TotalDifficulty *hexutil.Big `json:"totalDifficulty"` }
+	if err := rpc.Client().CallContext(ctx, &res, "eth_getBlockByNumber", "latest", false); err != nil {
+		return common.Hash{}, nil, nil, err
+	}
+	return head.Hash(), (*big.Int)(res.TotalDifficulty), genesis, nil
+}
+
+// HandlePeer performs eth/68 handshake and processes messages
 func (tm *TxMonitor) HandlePeer(peer *p2p.Peer, rw p2p.MsgReadWriter) error {
-	log.Printf("Connected to peer: %s", peer.ID().String())
-	defer log.Printf("Disconnected from peer: %s", peer.ID().String())
+	// Fetch chain data
+	headHash, headTD, genesisBlock, err := getHeadAndTD(tm.rpcClient)
+	if err != nil {
+		return fmt.Errorf("fetch head/TD: %w", err)
+	}
+	// Compute fork ID
+	headHeader, err := tm.rpcClient.HeaderByNumber(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("fetch head header: %w", err)
+	}
+	fk := forkid.NewID(params.MainnetChainConfig, genesisBlock, headHeader.Number.Uint64(), headHeader.Time)
 
-	// Ethereum mainnet genesis hash
-	genesisHash := common.HexToHash("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
-
-	// Do handshake
-	status := &StatusPacket{
+	// Send status
+	status := &statusData{
 		ProtocolVersion: 68,
 		NetworkID:       *networkID,
-		TD:              big.NewInt(1),
-		Head:            common.HexToHash("0x2386d1e9dea52b3496e1edccd13515f9b43689da9e8f9a61d6737a6000000000"),
-		Genesis:         genesisHash,
-		ForkID:          ForkID{Hash: [4]byte{0x40, 0xd2, 0xdc, 0x28}, Next: 0},
+		TD:              headTD,
+		Head:            headHash,
+		Genesis:         genesisBlock.Hash(),
+		ForkID:          fk,
 	}
-
 	if err := p2p.Send(rw, StatusMsg, status); err != nil {
 		return err
 	}
 
 	// Read peer status
 	msg, err := rw.ReadMsg()
-	if err != nil || msg.Code != StatusMsg {
-		return fmt.Errorf("invalid status message: %v", err)
+	if err != nil {
+		return err
 	}
-
-	var peerStatus StatusPacket
+	if msg.Code != StatusMsg {
+		return fmt.Errorf("expected status msg code, got %d", msg.Code)
+	}
+	var peerStatus statusData
 	if err := msg.Decode(&peerStatus); err != nil {
-		return fmt.Errorf("failed to decode status: %v", err)
+		return err
 	}
 
-	// Periodically ask for transactions
+	log.Printf("Connected to peer: %s", peer.ID())
+	defer log.Printf("Disconnected from peer: %s", peer.ID())
+
+	// Poll for tx hashes
 	go func() {
-		for {
-			if err := p2p.Send(rw, TransactionsMsg, []*types.Transaction{}); err != nil {
-				return
-			}
-			time.Sleep(30 * time.Second)
+		for range time.Tick(30 * time.Second) {
+			p2p.Send(rw, NewPooledTransactionHashesMsg, []common.Hash{})
 		}
 	}()
 
-	// Main message loop
+	// Message loop
 	for {
 		msg, err := rw.ReadMsg()
 		if err != nil {
 			return err
 		}
-
 		switch msg.Code {
 		case TransactionsMsg:
 			var txs []*types.Transaction
-			if err := msg.Decode(&txs); err == nil && len(txs) > 0 {
-				log.Printf("Received %d transactions", len(txs))
+			if msg.Decode(&txs) == nil {
 				tm.processTxs(txs)
 			}
-
 		case NewPooledTransactionHashesMsg:
 			var hashes []common.Hash
-			if err := msg.Decode(&hashes); err != nil {
-				// Try alternate format
-				var hashesBytes []byte
-				if err := msg.Decode(&hashesBytes); err == nil {
-					rlp.DecodeBytes(hashesBytes, &hashes)
-				}
-			}
-
-			if len(hashes) > 0 {
-				log.Printf("Received %d tx hashes, requesting txs", len(hashes))
+			if msg.Decode(&hashes) == nil {
 				p2p.Send(rw, GetPooledTransactionsMsg, hashes)
 			}
-
 		case PooledTransactionsMsg:
 			var txs []*types.Transaction
-			if err := msg.Decode(&txs); err == nil && len(txs) > 0 {
-				log.Printf("Received %d pooled transactions", len(txs))
+			if msg.Decode(&txs) == nil {
 				tm.processTxs(txs)
 			}
 		}
 	}
 }
 
+// processTxs logs and stores new transactions
 func (tm *TxMonitor) processTxs(txs []*types.Transaction) {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
-
 	for _, tx := range txs {
-		hash := tx.Hash().Hex()
-
-		if tm.knownHashes[hash] {
+		h := tx.Hash().Hex()
+		if tm.knownHashes[h] {
 			continue
 		}
-
-		tm.knownHashes[hash] = true
-
+		tm.knownHashes[h] = true
+		// Extract sender
 		signer := types.LatestSignerForChainID(tx.ChainId())
 		from, _ := types.Sender(signer, tx)
-
-		var to string
+		// Recipient
+		var toAddr string
 		if tx.To() != nil {
-			to = tx.To().Hex()
+			toAddr = tx.To().Hex()
 		}
-
+		// Build record
 		txInfo := TxInfo{
-			Hash:      hash,
+			Hash:      h,
 			Value:     tx.Value().String(),
 			From:      from.Hex(),
-			To:        to,
+			To:        toAddr,
 			Gas:       tx.Gas(),
 			GasPrice:  tx.GasPrice().String(),
 			Nonce:     tx.Nonce(),
 			Timestamp: time.Now(),
 		}
-
-		// Store transaction
-		tm.txs[hash] = txInfo
-
-		// Save to log file
-		if txJson, err := json.Marshal(txInfo); err == nil {
-			tm.txLogFile.WriteString(string(txJson) + "\n")
-		}
-
-		// Limit storage to 1000 transactions
+		// Store and log
+		tm.txs[h] = txInfo
+		b, _ := json.Marshal(txInfo)
+		tm.txLogFile.Write(b)
+		tm.txLogFile.WriteString("\n")
+		// Trim to 1000
 		if len(tm.txs) > 1000 {
 			for k := range tm.txs {
 				delete(tm.txs, k)
