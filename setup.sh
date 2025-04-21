@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+apt-get update
+apt-get install -y curl jq libsnappy-dev libc6-dev unzip build-essential git
+
 REPO="erigontech/erigon"
 API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 GO_VERSION="1.23.6"
 GO_TARBALL="go${GO_VERSION}.linux-amd64.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TARBALL}"
 INSTALL_DIR="/usr/local"
-CLONE_DIR="erigon"
 
 # 1. Ensure Go ≥ 1.23.x
 if ! command -v go >/dev/null || ! go version | grep -q "go1\.23"; then
@@ -26,29 +28,18 @@ echo "Fetching latest Erigon release..."
 TAG=$(curl -fsSL "${API_URL}" \
       | grep -Po '"tag_name": "\K.*?(?=")')
 echo "Latest release: ${TAG}"
-VERSION="${TAG#v}"        # strip leading "v"
+
+# 3. Clone that release
+VERSION="${TAG#v}"           # strip leading "v"
 BRANCH="release/${VERSION}"
+echo "Cloning ${REPO} (${BRANCH})..."
+git clone --branch "${BRANCH}" --single-branch --depth 1 \
+      "https://github.com/${REPO}.git" erigon \
+  || git clone --branch "${TAG}" --single-branch --depth 1 \
+      "https://github.com/${REPO}.git" erigon
 
-# 3. Clone or update repo
-if [ -d "${CLONE_DIR}" ]; then
-  echo "Updating existing ${CLONE_DIR}/…"
-  git -C "${CLONE_DIR}" pull --ff-only \
-    && echo "✅ Pulled latest changes." \
-    || echo "⚠️  Pull failed; you may need to resolve conflicts or remove ${CLONE_DIR}/ and retry."
-else
-  echo "Cloning ${REPO} (${BRANCH})…"
-  git clone --branch "${BRANCH}" --single-branch --depth 1 \
-        "https://github.com/${REPO}.git" "${CLONE_DIR}" \
-    || git clone --branch "${TAG}" --single-branch --depth 1 \
-        "https://github.com/${REPO}.git" "${CLONE_DIR}"
-fi
+cd erigon
 
-cd "${CLONE_DIR}"
-
-# 4. Build Erigon
-echo "Building Erigon…"
+# 4. Build
+echo "Building Erigon..."
 make erigon
-
-# 5. Run in minimal prune mode
-echo "Starting Erigon in minimal mode…"
-exec ./build/bin/erigon --prune.mode=minimal
